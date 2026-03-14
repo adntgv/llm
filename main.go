@@ -66,7 +66,7 @@ func (c *LLMClient) calculateContextUsed() (int, error) {
 
 func сalculateTokens(content string) (int, error) {
 	// This is a very naive token calculation. In a real implementation, you would want to use a proper tokenizer for the model you're using.
-	toks := tokenizer.NewTokenizer()
+	toks := tokenizer.NewTokeniz()
 	tokens, err := toks.Encode(content)
 	if err != nil {
 		return 0, err
@@ -291,7 +291,11 @@ func main() {
 
 		input = strings.TrimSpace(input)
 
-		messages = append(messages, Message{User, input})
+		err = c.AddMessage(User, input)
+		if err != nil {
+			fmt.Printf("Error adding message: %v\n", err)
+			continue
+		}
 
 		err = c.StreamSSE(messages)
 		if err != nil {
