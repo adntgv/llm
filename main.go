@@ -174,36 +174,6 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
-func (c *LLMClient) Chat(messages []Message) (string, error) {
-	data := &Request{
-		Model:       c.model,
-		Messages:    messages,
-		Temperature: 0.7,
-	}
-
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return "", err
-	}
-
-	resp, err := http.Post(c.url, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	response := &Response{}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	err = json.Unmarshal([]byte(body), response)
-
-	return response.Choices[0].Message.Content, nil
-}
-
 func (c *LLMClient) StreamSSE(messages []Message) error {
 	data := &Request{
 		Model:       c.model,
@@ -259,10 +229,10 @@ func (c *LLMClient) StreamSSE(messages []Message) error {
 		} else {
 			// fmt.Println(line)
 		}
+	}
 
-		if len(totalResponse) > 0 {
-			c.AddMessage(Role("assistant"), totalResponse)
-		}
+	if len(totalResponse) > 0 {
+		c.AddMessage(Role("assistant"), totalResponse)
 	}
 
 	return nil
