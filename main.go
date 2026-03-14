@@ -66,12 +66,16 @@ func (c *LLMClient) calculateContextUsed() (int, error) {
 
 func сalculateTokens(content string) (int, error) {
 	// This is a very naive token calculation. In a real implementation, you would want to use a proper tokenizer for the model you're using.
-	toks := tokenizer.NewTokeniz()
-	tokens, err := toks.Encode(content)
+	toker, err := tokenizer.Get(tokenizer.Cl100kBase)
 	if err != nil {
 		return 0, err
 	}
-	return len(tokens), nil
+
+	count, err := toker.Count(content)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (c *LLMClient) Compact() {
@@ -222,6 +226,8 @@ func (c *LLMClient) StreamSSE(messages []Message) error {
 	reader := bufio.NewReader(resp.Body)
 	scanner := bufio.NewScanner(reader)
 
+	totalResponse := ""
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		// fmt.Println("Line: ", line)
@@ -244,37 +250,26 @@ func (c *LLMClient) StreamSSE(messages []Message) error {
 
 			if err := json.Unmarshal([]byte(data), &response); err != nil {
 				return fmt.Errorf("JSON Parsing error: data %v, error: %v", data, err)
-			} else {
+			} else if len(response.Choices) > 0 {
 				fmt.Print(response.Choices[0].Delta.Content)
+				totalResponse += response.Choices[0].Delta.Content
+			} else {
+				fmt.Println("Response data:  ", data)
 			}
 		} else {
-			fmt.Println(line)
+			// fmt.Println(line)
+		}
+
+		if len(totalResponse) > 0 {
+			c.AddMessage(Role("assistant"), totalResponse)
 		}
 	}
 
 	return nil
 }
 
-// Reads stdin until newline or EOF
-func readMultiline(reader *bufio.Reader) (string, error) {
-	var buffer bytes.Buffer
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				return buffer.String(), nil
-			}
-			return "", err
-		}
-
-		buffer.WriteString(line)
-	}
-}
-
 func main() {
 	c := NewClient()
-
-	messages := []Message{}
 
 	reader := bufio.NewReader(os.Stdin)
 
@@ -297,10 +292,12 @@ func main() {
 			continue
 		}
 
-		err = c.StreamSSE(messages)
+		err = c.StreamSSE(c.messages)
 		if err != nil {
 			fmt.Println(err)
 			break
 		}
+
+		fmt.Printf("Tokens used: %v %%, %v of %v\n", c.contextUsed*100/c.contextLimit, c.contextUsed, c.contextLimit)
 	}
 }
