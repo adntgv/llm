@@ -244,6 +244,7 @@ func main() {
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
+		fmt.Print(">>>: ")
 		input, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -268,6 +269,6 @@ func main() {
 			break
 		}
 
-		fmt.Printf("Tokens used: %v %%, %v of %v\n", c.contextUsed*100/c.contextLimit, c.contextUsed, c.contextLimit)
+		fmt.Printf("Tokens used: %v %%, %v of %v\n\n", c.contextUsed*100/c.contextLimit, c.contextUsed, c.contextLimit)
 	}
 }
