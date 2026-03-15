@@ -345,6 +345,7 @@ func (c *LLMClient) StreamSSE(messages []Message) (ToolCallsMap, error) {
 func main() {
 	Tools := []Tool{
 		&WeatherTool,
+		&ExecTool,
 	}
 
 	c := NewClient(Tools)
@@ -366,7 +367,7 @@ func main() {
 		// input = strings.TrimSpace(input)
 
 		// err = c.AddMessage(User, input)
-		err := c.AddMessage(User, "weather in Astana, celsius")
+		err := c.AddMessage(User, "list files in current directory")
 		if err != nil {
 			fmt.Printf("Error adding message: %v\n", err)
 			continue
@@ -378,10 +379,10 @@ func main() {
 			break
 		}
 
-		if len(toolCalls) > 0 {
+		for len(toolCalls) > 0 {
 			c.doToolCalls(toolCalls)
 
-			_, err := c.StreamSSE(c.messages)
+			toolCalls, err = c.StreamSSE(c.messages)
 			if err != nil {
 				fmt.Println("ERROR", err)
 				break
