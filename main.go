@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/tiktoken-go/tokenizer"
@@ -344,30 +345,33 @@ func (c *LLMClient) StreamSSE(messages []Message) (ToolCallsMap, error) {
 
 func main() {
 	Tools := []Tool{
-		&WeatherTool,
 		&ExecTool,
 	}
 
 	c := NewClient(Tools)
-
-	// reader := bufio.NewReader(os.Stdin)
+	reader := bufio.NewReader(os.Stdin)
 
 	for {
-		// fmt.Print(">>>: ")
-		// input, err := reader.ReadString('\n')
-		// if err != nil {
-		// 	if err == io.EOF {
-		// 		fmt.Println("\nEOF received. Exiting.")
-		// 		return
-		// 	}
-		// 	fmt.Printf("Error reading input: %v\n", err)
-		// 	continue
-		// }
+		fmt.Print(">>>: ")
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				fmt.Println("\nEOF received. Exiting.")
+				return
+			}
+			fmt.Printf("Error reading input: %v\n", err)
+			continue
+		}
 
-		// input = strings.TrimSpace(input)
+		input = strings.TrimSpace(input)
 
-		// err = c.AddMessage(User, input)
-		err := c.AddMessage(User, "list files in current directory")
+		// Allow user to exit gracefully by typing "quit" or "exit"
+		if input == "quit" || input == "exit" {
+			fmt.Println("\nExiting...")
+			break
+		}
+
+		err = c.AddMessage(User, input)
 		if err != nil {
 			fmt.Printf("Error adding message: %v\n", err)
 			continue
@@ -389,9 +393,7 @@ func main() {
 			}
 		}
 
-		fmt.Printf("Tokens used: %v%%, %v of %v\n\n", c.contextUsed*100/c.contextLimit, c.contextUsed, c.contextLimit)
-
-		break
+		fmt.Printf("\nTokens used: %v%%, %v of %v\n\n", c.contextUsed*100/c.contextLimit, c.contextUsed, c.contextLimit)
 	}
 }
 
