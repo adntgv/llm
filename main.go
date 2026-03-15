@@ -7,10 +7,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/tiktoken-go/tokenizer"
+)
+
+const (
+	DEBUG = false
+
+	toolCallFinishReason = "tool_calls"
 )
 
 type LLMClient struct {
@@ -21,16 +26,67 @@ type LLMClient struct {
 	messages     []Message
 	contextLimit int
 	contextUsed  int
+	tools        map[string]Tool
 }
 
-func NewClient() *LLMClient {
+func (c *LLMClient) getToolsList() []Tool {
+	toolsList := make([]Tool, 0)
+	for _, tool := range c.tools {
+		toolsList = append(toolsList, tool)
+	}
+	return toolsList
+}
+
+type Tool interface {
+	GetName() string
+	GetDescription() string
+	Exec(args string) string
+}
+
+type FunctionTool struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+	execFn   func(string) string
+}
+
+func (f *FunctionTool) GetName() string {
+	return f.Function.Name
+}
+
+func (f *FunctionTool) GetDescription() string {
+	return f.Function.Description
+}
+
+func (f *FunctionTool) Exec(args string) string {
+	return f.execFn(args)
+}
+
+type ToolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  ToolParameters `json:"parameters"`
+}
+
+type ToolParameters struct {
+	Type       string                 `json:"type"`
+	Properties map[string]interface{} `json:"properties"`
+	Required   []string               `json:"required"`
+}
+
+func NewClient(tools []Tool) *LLMClient {
+	toolsMap := make(map[string]Tool, len(tools))
+	for _, tool := range tools {
+		toolsMap[tool.GetName()] = tool
+	}
+
 	client := &LLMClient{
 		url:          "http://localhost:1234/v1/chat/completions", // LM Studio API
 		model:        "qwen/qwen3.5-35b-a3b",
-		system:       "you are a senior software engineer",
+		system:       "you are a senior software engineer. ",
 		summary:      "",
 		contextLimit: 200000,
 		contextUsed:  0,
+		tools:        toolsMap,
 	}
 
 	client.messages = []Message{
@@ -55,7 +111,7 @@ func (c *LLMClient) AddMessage(role Role, content string) error {
 func (c *LLMClient) calculateContextUsed() (int, error) {
 	total := 0
 	for _, msg := range c.messages {
-		toks, err := сalculateTokens(msg.Content)
+		toks, err := calculateTokens(msg.Content)
 		if err != nil {
 			return 0, err
 		}
@@ -64,7 +120,7 @@ func (c *LLMClient) calculateContextUsed() (int, error) {
 	return total, nil
 }
 
-func сalculateTokens(content string) (int, error) {
+func calculateTokens(content string) (int, error) {
 	// This is a very naive token calculation. In a real implementation, you would want to use a proper tokenizer for the model you're using.
 	toker, err := tokenizer.Get(tokenizer.Cl100kBase)
 	if err != nil {
@@ -133,13 +189,29 @@ func (c *LLMClient) Summarize() string {
 type Role string
 
 const (
-	System Role = "system"
-	User   Role = "user"
+	System    Role = "system"
+	User      Role = "user"
+	Assistant Role = "assistant"
+	ToolRole  Role = "tool"
 )
 
 type Message struct {
-	Role    Role   `json:"role"`
-	Content string `json:"content"`
+	Role         Role       `json:"role"`
+	Content      string     `json:"content"`
+	ToolCalls    []ToolCall `json:"tool_calls"`
+	FinishReason string     `json:"finish_reason"`
+}
+
+type ToolCall struct {
+	Index    int              `json:"index"`
+	Id       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
+}
+
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type Request struct {
@@ -147,6 +219,8 @@ type Request struct {
 	Messages    []Message `json:"messages"`
 	Temperature float32   `json:"temperature"`
 	Stream      bool      `json:"stream"`
+	Tools       []Tool    `json:"tools"`
+	ToolChoice  string    `json:"tool_choice,omitempty"`
 }
 
 type Response struct {
@@ -174,22 +248,31 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
-func (c *LLMClient) StreamSSE(messages []Message) error {
+type ToolCallsMap map[string]string
+
+type ToolCallArgs map[string]string
+
+func (c *LLMClient) StreamSSE(messages []Message) (ToolCallsMap, error) {
 	data := &Request{
 		Model:       c.model,
 		Messages:    messages,
 		Temperature: 0.7,
 		Stream:      true,
+		Tools:       c.getToolsList(),
+		ToolChoice:  "auto",
 	}
 
-	jsonData, err := json.Marshal(data)
+	jsonData, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	fmt.Println("json data: ", string(jsonData))
+	// debugPrint("json data: %v \n", string(jsonData))
 
 	resp, err := http.Post(c.url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -198,12 +281,16 @@ func (c *LLMClient) StreamSSE(messages []Message) error {
 
 	totalResponse := ""
 
+	toolCalls := make(ToolCallsMap, 0)
+	lastFunctionName := ""
+
 	for scanner.Scan() {
 		line := scanner.Text()
-		// fmt.Println("Line: ", line)
 
-		if strings.HasPrefix(line, "data:") {
-			data := strings.TrimPrefix(line, "data:")
+		debugPrint("Line: %v \n", line)
+
+		if after, ok := strings.CutPrefix(line, "data:"); ok {
+			data := after
 			data = strings.TrimSpace(data)
 			if len(data) == 0 {
 				continue
@@ -219,56 +306,171 @@ func (c *LLMClient) StreamSSE(messages []Message) error {
 			var response Response
 
 			if err := json.Unmarshal([]byte(data), &response); err != nil {
-				return fmt.Errorf("JSON Parsing error: data %v, error: %v", data, err)
+				return nil, fmt.Errorf("JSON Parsing error: data %v, error: %v", data, err)
 			} else if len(response.Choices) > 0 {
-				fmt.Print(response.Choices[0].Delta.Content)
-				totalResponse += response.Choices[0].Delta.Content
+				firstChoice := response.Choices[0]
+				if firstChoice.FinishReason == toolCallFinishReason {
+					return toolCalls, nil
+				}
+				if len(firstChoice.Delta.Content) > 0 {
+					fmt.Print(firstChoice.Delta.Content)
+					totalResponse += firstChoice.Delta.Content
+				} else if len(firstChoice.Delta.ToolCalls) > 0 {
+
+					for _, toolCall := range firstChoice.Delta.ToolCalls {
+						if toolCall.Function.Name != "" {
+							lastFunctionName = toolCall.Function.Name
+						} else if toolCall.Function.Arguments != "" {
+							toolCalls[lastFunctionName] = toolCall.Function.Arguments
+						}
+					}
+
+				}
 			} else {
 				fmt.Println("Response data:  ", data)
 			}
 		} else {
-			// fmt.Println(line)
+			line = strings.TrimSpace(line)
+			fmt.Print(line)
 		}
 	}
 
 	if len(totalResponse) > 0 {
-		c.AddMessage(Role("assistant"), totalResponse)
+		c.AddMessage(Assistant, totalResponse)
 	}
 
-	return nil
+	return nil, err
 }
 
 func main() {
-	c := NewClient()
+	Tools := []Tool{
+		&FunctionTool{
+			Type: "function",
+			execFn: func(arg string) string {
+				fmt.Println(arg)
+				tca := make(ToolCallArgs)
+				err := json.Unmarshal([]byte(arg), &tca)
+				if err != nil {
+					return fmt.Sprintf("Error parsing tool call arguments: %v", err)
+				}
+				const apiKey = "c97680a34e494868a3d203825261503"
+				url := "http://api.weatherapi.com/v1/current.json?key=" + apiKey + "&q=" + tca["location"] + "&aqi=no"
+				resp, err := http.Get(url)
+				if err != nil {
+					return fmt.Sprintf("Error making weather API request: %v", err)
+				}
+				defer resp.Body.Close()
 
-	reader := bufio.NewReader(os.Stdin)
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					return fmt.Sprintf("Error reading weather API response: %v", err)
+				}
+
+				var weatherResponse struct {
+					Current struct {
+						TempC     float64 `json:"temp_c"`
+						TempF     float64 `json:"temp_f"`
+						Condition struct {
+							Text string `json:"text"`
+						} `json:"condition"`
+					} `json:"current"`
+				}
+
+				err = json.Unmarshal(body, &weatherResponse)
+				if err != nil {
+					return fmt.Sprintf("Error parsing weather API response: %v", err)
+				}
+
+				if tca["unit"] == "celsius" {
+					return fmt.Sprintf("The current weather in %s is %.1f °C with %s.", tca["location"], weatherResponse.Current.TempC, weatherResponse.Current.Condition.Text)
+				} else {
+					return fmt.Sprintf("The current weather in %s is %.1f °F with %s.", tca["location"], weatherResponse.Current.TempF, weatherResponse.Current.Condition.Text)
+				}
+			},
+			Function: ToolFunction{
+				Name:        "get_current_weather",
+				Description: "Get the current weather in a given location",
+				Parameters: ToolParameters{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"location": map[string]interface{}{
+							"type":        "string",
+							"description": "The city and state, e.g. San Francisco, CA",
+						},
+						"unit": map[string]interface{}{
+							"type": "string",
+							"enum": []string{"celsius", "fahrenheit"},
+						},
+					},
+					Required: []string{"location", "unit"},
+				},
+			},
+		},
+	}
+
+	c := NewClient(Tools)
+
+	// reader := bufio.NewReader(os.Stdin)
 
 	for {
-		fmt.Print(">>>: ")
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				fmt.Println("\nEOF received. Exiting.")
-				return
-			}
-			fmt.Printf("Error reading input: %v\n", err)
-			continue
-		}
+		// fmt.Print(">>>: ")
+		// input, err := reader.ReadString('\n')
+		// if err != nil {
+		// 	if err == io.EOF {
+		// 		fmt.Println("\nEOF received. Exiting.")
+		// 		return
+		// 	}
+		// 	fmt.Printf("Error reading input: %v\n", err)
+		// 	continue
+		// }
 
-		input = strings.TrimSpace(input)
+		// input = strings.TrimSpace(input)
 
-		err = c.AddMessage(User, input)
+		// err = c.AddMessage(User, input)
+		err := c.AddMessage(User, "weather in Astana, celsius")
 		if err != nil {
 			fmt.Printf("Error adding message: %v\n", err)
 			continue
 		}
 
-		err = c.StreamSSE(c.messages)
+		toolCalls, err := c.StreamSSE(c.messages)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Println("ERROR", err)
 			break
 		}
 
-		fmt.Printf("Tokens used: %v %%, %v of %v\n\n", c.contextUsed*100/c.contextLimit, c.contextUsed, c.contextLimit)
+		if len(toolCalls) > 0 {
+			c.doToolCalls(toolCalls)
+
+			_, err := c.StreamSSE(c.messages)
+			if err != nil {
+				fmt.Println("ERROR", err)
+				break
+			}
+		}
+
+		fmt.Printf("Tokens used: %v%%, %v of %v\n\n", c.contextUsed*100/c.contextLimit, c.contextUsed, c.contextLimit)
+
+		break
+	}
+}
+
+func (c *LLMClient) doToolCalls(toolCalls ToolCallsMap) []string {
+	for toolName, toolCallArgs := range toolCalls {
+		c.AddMessage(Assistant, fmt.Sprintf("Calling tool: %s with args: %s", toolName, toolCallArgs))
+		result := c.doToolCall(toolName, toolCallArgs)
+		c.AddMessage(ToolRole, result)
+	}
+
+	return nil
+}
+
+func (c *LLMClient) doToolCall(fname string, args string) string {
+	return c.tools[fname].Exec(args)
+}
+
+func debugPrint(template string, args ...interface{}) {
+	if DEBUG {
+		fmt.Printf(template, args...)
 	}
 }
