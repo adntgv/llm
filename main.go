@@ -81,9 +81,22 @@ func NewClient(tools []Tool) *LLMClient {
 	}
 
 	client := &LLMClient{
-		url:          "http://localhost:1234/v1/chat/completions", // LM Studio API
-		model:        "qwen/qwen3.5-35b-a3b",
-		system:       "you are a senior software engineer. ",
+		url:   "http://localhost:1234/v1/chat/completions", // LM Studio API
+		model: "qwen/qwen3.5-9b",
+		system: `
+PERSONA:		
+you are a senior software engineer. 
+
+PROGRAM:
+follow: Reason -> Act -> Observe -> Repeat.
+Reason: "I need to know what is in main.go."
+Act: Call ReadFile tool.
+Observe: Get file content.
+Reason: "Now I need to rewrite it to use pointers."
+
+TOOLS:
+Never type "Calling Tool", instead directly call the tool and get the result. Your LLM response should only be the tool call with arguments.
+`,
 		summary:      "",
 		contextLimit: 200000,
 		contextUsed:  0,
@@ -97,14 +110,14 @@ func NewClient(tools []Tool) *LLMClient {
 	return client
 }
 
-func (c *LLMClient) AddMessage(role Role, content string) error {
+func (c *LLMClient) AddMessage(role Role, content string, toolCalls []ToolCall, finishReason string) error {
 	var err error
 
-	c.messages = append(c.messages, Message{Role: role, Content: content})
+	c.messages = append(c.messages, Message{Role: role, Content: content, ToolCalls: toolCalls, FinishReason: finishReason})
 	c.contextUsed, err = c.calculateContextUsed()
 	if err != nil {
 		fmt.Printf("Error calculating context used: %v\n", err)
-		return err
+		return fmt.Errorf("Error calculating context used: %v", err)
 	}
 	return nil
 }
@@ -114,7 +127,7 @@ func (c *LLMClient) calculateContextUsed() (int, error) {
 	for _, msg := range c.messages {
 		toks, err := calculateTokens(msg.Content)
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("Error calculating tokens for message: %v", err)
 		}
 		total += toks
 	}
@@ -125,12 +138,12 @@ func calculateTokens(content string) (int, error) {
 	// This is a very naive token calculation. In a real implementation, you would want to use a proper tokenizer for the model you're using.
 	toker, err := tokenizer.Get(tokenizer.Cl100kBase)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("Error initializing tokenizer: %v", err)
 	}
 
 	count, err := toker.Count(content)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("Error counting tokens: %v", err)
 	}
 	return count, nil
 }
@@ -265,7 +278,7 @@ func (c *LLMClient) StreamSSE(messages []Message) (ToolCallsMap, error) {
 
 	jsonData, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error marshaling request: %v", err)
 	}
 
 	fmt.Println("json data: ", string(jsonData))
@@ -273,9 +286,16 @@ func (c *LLMClient) StreamSSE(messages []Message) (ToolCallsMap, error) {
 
 	resp, err := http.Post(c.url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error making request: %v", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		status := resp.Status
+
+		return nil, fmt.Errorf("Non-OK HTTP status: %s, body: %s, url: %s", status, string(body), resp.Proto)
+	}
 
 	reader := bufio.NewReader(resp.Body)
 	scanner := bufio.NewScanner(reader)
@@ -284,6 +304,8 @@ func (c *LLMClient) StreamSSE(messages []Message) (ToolCallsMap, error) {
 
 	toolCalls := make(ToolCallsMap, 0)
 	lastFunctionName := ""
+
+	allToolCalls := make([]ToolCall, 0)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -317,7 +339,7 @@ func (c *LLMClient) StreamSSE(messages []Message) (ToolCallsMap, error) {
 					fmt.Print(firstChoice.Delta.Content)
 					totalResponse += firstChoice.Delta.Content
 				} else if len(firstChoice.Delta.ToolCalls) > 0 {
-
+					allToolCalls = append(allToolCalls, firstChoice.Delta.ToolCalls...)
 					for _, toolCall := range firstChoice.Delta.ToolCalls {
 						if toolCall.Function.Name != "" {
 							lastFunctionName = toolCall.Function.Name
@@ -331,13 +353,16 @@ func (c *LLMClient) StreamSSE(messages []Message) (ToolCallsMap, error) {
 				fmt.Println("Response data:  ", data)
 			}
 		} else {
+
 			line = strings.TrimSpace(line)
-			fmt.Print(line)
+			if len(line) > 0 {
+				fmt.Println("Non-data line: ", line)
+			}
 		}
 	}
 
 	if len(totalResponse) > 0 {
-		c.AddMessage(Assistant, totalResponse)
+		c.AddMessage(Assistant, totalResponse, nil, "")
 	}
 
 	return nil, err
@@ -371,7 +396,7 @@ func main() {
 			break
 		}
 
-		err = c.AddMessage(User, input)
+		err = c.AddMessage(User, input, nil, "")
 		if err != nil {
 			fmt.Printf("Error adding message: %v\n", err)
 			continue
@@ -398,10 +423,20 @@ func main() {
 }
 
 func (c *LLMClient) doToolCalls(toolCalls ToolCallsMap) []string {
+
 	for toolName, toolCallArgs := range toolCalls {
-		c.AddMessage(Assistant, fmt.Sprintf("Calling tool: %s with args: %s", toolName, toolCallArgs))
+		c.AddMessage(Assistant, "", []ToolCall{
+			{
+				Type: "function",
+				Function: ToolCallFunction{
+					Name:      toolName,
+					Arguments: toolCallArgs,
+				},
+			},
+		}, "tool_calls")
+
 		result := c.doToolCall(toolName, toolCallArgs)
-		c.AddMessage(ToolRole, result)
+		c.AddMessage(ToolRole, result, nil, "")
 	}
 
 	return nil
